@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Mapa do evento</title>
+<!-- The app's map (06/11/2026): the same map as the site (EventMap.web.tsx), opened inside the app. Everything comes from
+     our own server: this page, the library (lib/), the drawing rules, the letters and the map of Brazil. No outside
+     service learns who opened an event (RNF34). -->
+<link rel="stylesheet" href="lib/maplibre-gl.css">
+<style>
+  html, body, #map { margin: 0; height: 100%; width: 100%; background: #e9e9e9; }
+  .failed { display: none; height: 100%; align-items: center; justify-content: center; padding: 16px; text-align: center;
+            font: 14px sans-serif; color: #475569; }
+</style>
+</head>
+<body>
+<div id="map" role="application"></div>
+<div class="failed" id="failed">Não foi possível abrir o mapa agora. Tente de novo mais tarde.</div>
+<script src="lib/maplibre-gl.js"></script>
+<script src="lib/pmtiles.js"></script>
+<script>
+  // Parameters from the app: api (the server), lat/lng (the pin), clat/clng (where to look without a pin),
+  // editable ("1": the creator of the event moves the pin), label (what a screen reader says).
+  var q = new URLSearchParams(location.search);
+  var num = function (k) { var v = q.get(k); return v === null || v === '' ? null : Number(v); };
+  var pin = num('lat') !== null ? { latitude: num('lat'), longitude: num('lng') } : null;
+  var center = num('clat') !== null ? { latitude: num('clat'), longitude: num('clng') } : null;
+  var editable = q.get('editable') === '1';
+  var MACEIO = { latitude: -9.6658, longitude: -35.7353 };
+  var ZOOM_CITY = 13, ZOOM_PLACE = 17;
+  var tell = function (msg) { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(msg)); };
+  // Development only, read by the app's log (EventMap.tsx): what went wrong inside the map, which the app cannot see.
+  window.addEventListener('error', function (e) { tell({ error: 'página: ' + e.message }); });
+  window.addEventListener('unhandledrejection', function (e) { tell({ error: 'promessa: ' + (e.reason && e.reason.message || e.reason) }); });
+  var fail = function () { document.getElementById('map').style.display = 'none'; document.getElementById('failed').style.display = 'flex'; };
+
+  // The pieces of the map come THROUGH THE APP (08/11/2026): on the iPhone this page could not reach the API at all
+  // ("Load failed", nothing arrived at the server), while the app itself reaches it. So the page asks the app for
+  // each piece (bytes of brasil.pmtiles) and the app fetches it from our API and hands it back (EventMap.tsx).
+  var waiting = {}, asked = 0;
+  var viaApp = !!window.ReactNativeWebView;
+  var appSource = {
+    getKey: function () { return 'brasil'; },
+    getBytes: function (offset, length) {
+      return new Promise(function (resolve, reject) {
+        var id = ++asked;
+        waiting[id] = { resolve: resolve, reject: reject };
+        tell({ bytes: { id: id, offset: offset, length: length } });
+      });
+    },
+  };
+  window.fotomacBytes = function (id, base64, failure) {
+    var w = waiting[id];
+    delete waiting[id];
+    if (!w) return;
+    if (failure) { w.reject(new Error(failure)); return; }
+    var bin = atob(base64), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    w.resolve({ data: out.buffer });
+  };
+  var protocol = new pmtiles.Protocol({ metadata: true });
+  if (viaApp) protocol.add(new pmtiles.PMTiles(appSource));
+  maplibregl.addProtocol('pmtiles', protocol.tile);
+  fetch('style.json').then(function (r) { return r.json(); }).then(function (style) {
+    style.sources.protomaps.url = viaApp ? 'pmtiles://brasil' : 'pmtiles://' + q.get('api') + '/api/v1/map/brasil.pmtiles';
+    style.glyphs = location.origin + '/map/fonts/{fontstack}/{range}.pbf';
+    style.sprite = location.origin + '/map/sprites/light';
+    var look = pin || center || MACEIO;
+    var map = new maplibregl.Map({
+      container: 'map', style: style, center: [look.longitude, look.latitude], maxBounds: [[-75, -35], [-33, 6.5]],
+      zoom: pin || center ? ZOOM_PLACE : ZOOM_CITY, attributionControl: { compact: false },
+      // One finger scrolls the app's page; two move the map (the site does the same on a phone).
+      cooperativeGestures: true,
+      locale: { 'CooperativeGesturesHandler.MobileHelpText': 'Use dois dedos para mover o mapa',
+                'NavigationControl.ZoomIn': 'Aproximar o mapa', 'NavigationControl.ZoomOut': 'Afastar o mapa',
+                'NavigationControl.ResetBearing': 'Apontar o mapa para o norte' },
+    });
+    map.getCanvas().setAttribute('aria-label', q.get('label') || 'Mapa');
+    map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), 'top-right');
+    // Lost on the map: one button back to the pin, or to Maceió when there is none (the same as the site,
+    // EventMap.web.tsx; missing in the app until 08/11/2026, user test).
+    var back = null;
+    var backLabel = function () {
+      var label = pin ? 'Voltar ao pin' : 'Voltar para Maceió';
+      if (back) { back.setAttribute('aria-label', label); back.title = label; }
+    };
+    map.addControl({
+      onAdd: function () {
+        var group = document.createElement('div');
+        group.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+        back = document.createElement('button');
+        back.type = 'button';
+        back.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#333" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="display:block;margin:auto"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>';
+        back.addEventListener('click', function () {
+          var to = pin || MACEIO;
+          map.flyTo({ center: [to.longitude, to.latitude], zoom: pin ? ZOOM_PLACE : ZOOM_CITY, speed: 2 });
+        });
+        backLabel();
+        group.appendChild(back);
+        return group;
+      },
+      onRemove: function () { back = null; },
+    }, 'top-right');
+    map.on('error', function (e) { tell({ error: 'mapa: ' + (e.error && e.error.message || 'erro') + (e.sourceId ? ' (' + e.sourceId + ')' : '') }); if (!map.isStyleLoaded() && e.sourceId === undefined) fail(); });
+    var marker = null;
+    var place = function (p) {
+      pin = p;
+      backLabel();
+      if (!p) { if (marker) marker.remove(); marker = null; return; }
+      if (marker) { marker.setLngLat([p.longitude, p.latitude]); return; }
+      marker = new maplibregl.Marker({ color: '#C63D4A', draggable: editable }).setLngLat([p.longitude, p.latitude]).addTo(map);
+      marker.on('dragend', function () { var at = marker.getLngLat(); pin = { latitude: at.lat, longitude: at.lng }; tell({ pin: pin }); });
+    };
+    place(pin);
+    if (!pin && editable) tell({ pin: look });
+    if (editable) map.on('click', function (e) { tell({ pin: { latitude: e.lngLat.lat, longitude: e.lngLat.lng } }); });
+    // Orders from the app: move the pin, look at a point, pin where the map looks.
+    window.fotomac = {
+      setPin: function (p) { place(p); },
+      lookAt: function (p) { map.flyTo({ center: [p.longitude, p.latitude], zoom: ZOOM_PLACE, speed: 2 }); },
+      pinAtCenter: function () { var c = map.getCenter(); tell({ pin: { latitude: c.lat, longitude: c.lng } }); },
+    };
+    tell({ ready: true });
+  }).catch(fail);
+</script>
+</body>
+</html>
