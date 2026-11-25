@@ -67,7 +67,7 @@ precisam ter a mesma interface exportada.
 ```bash
 infra/setup_local.sh                       # uma vez por máquina (PostgreSQL 17 via Homebrew no macOS)
 cd backend && python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/alembic upgrade head
+.venv/bin/alembic upgrade head && .venv/bin/alembic -x db=test upgrade head   # banco principal e de testes
 cd frontend && npm ci                    # respeita as versões travadas
 
 infra/seaweedfs.sh start

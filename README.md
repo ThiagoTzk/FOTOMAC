@@ -113,7 +113,8 @@ Em servidores Linux (Debian/Ubuntu), o pacote é `postgresql-17-pgvector`.
 ```bash
 infra/setup_local.sh            # banco, credenciais locais (backend/.env) e modelos faciais conferidos
 cd backend && python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/alembic upgrade head
+.venv/bin/alembic upgrade head                 # banco principal
+.venv/bin/alembic -x db=test upgrade head       # banco dos testes
 cd ../frontend && npm ci
 ```
 
@@ -142,7 +143,8 @@ senha. As demais contas são criadas no painel, em **Contas**.
 cd backend && .venv/bin/python scripts/create_first_admin.py --email administrador@instituicao.edu.br
 ```
 
-O comando recusa rodar se a instalação já tiver um administrador.
+Se o link vencer sem ser usado, rode o mesmo comando com o mesmo e-mail: sai um link novo e o anterior deixa de
+valer. Depois que um administrador ativa a conta, o comando passa a recusar.
 
 ### Produção
 

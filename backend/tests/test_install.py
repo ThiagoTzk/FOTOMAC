@@ -5,7 +5,7 @@ import re
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.accounts.install import create_first_admin
 from app.db import models as m
@@ -49,10 +49,35 @@ def test_the_first_administrator_has_no_password_and_defines_it_by_the_printed_l
         app.dependency_overrides.clear()
 
 
-def test_only_once_per_installation(empty):
-    create_first_admin(empty, "administrador@cesmac.edu.br")
-    with pytest.raises(EventError, match="já tem administrador"):
-        create_first_admin(empty, "outro@cesmac.edu.br")
+def test_a_lost_or_expired_link_is_replaced_while_nobody_activated(empty):
+    """The link expired unused: the same command, with the same e-mail, gives a new one; the old one stops working."""
+    db = empty
+    first = re.search(r"token=([\w-]+)$", create_first_admin(db, "administrador@cesmac.edu.br")).group(1)
+    second = re.search(r"token=([\w-]+)$", create_first_admin(db, "administrador@cesmac.edu.br")).group(1)
+    assert first != second
+    assert db.scalar(select(func.count()).select_from(m.Account).where(m.Account.role == m.AccountRole.ADMIN)) == 1
+    with pytest.raises(EventError, match="aguardando o primeiro acesso"):
+        create_first_admin(db, "outro@cesmac.edu.br")                  # a second, different admin: no
+    login_limiter.reset()
+    password_link_limiter.reset()
+    app.dependency_overrides[get_session] = lambda: db
+    try:
+        body = {"password": STRONG, "password_confirmation": STRONG}
+        assert TestClient(app).post("/api/v1/auth/first-access", json={"token": first, **body}).status_code != 200
+        assert TestClient(app).post("/api/v1/auth/first-access", json={"token": second, **body}).status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_refused_once_an_administrator_is_active(empty):
+    db = empty
+    admin = m.Account(full_name="Ana Lima", email="ana@cesmac.edu.br", role=m.AccountRole.ADMIN,
+                      password_hash="x", status=m.AccountStatus.ACTIVE)
+    db.add(admin)
+    db.flush()
+    for email in ("administrador@cesmac.edu.br", "ana@cesmac.edu.br"):
+        with pytest.raises(EventError, match="já tem administrador"):
+            create_first_admin(db, email)
 
 
 @pytest.mark.parametrize("email, name, says", [
