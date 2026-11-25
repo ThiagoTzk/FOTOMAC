@@ -28,7 +28,8 @@ from app.db import models as m
 @pytest.fixture(scope="session")
 def db_engine():
     url = get_settings().test_database_url
-    assert url and url.endswith("/fotomac_test"), "tests must never touch the main database"
+    # Any installation's test database is "<name>_test" (infra/setup_local.sh, FOTOMAC_DB_NAME).
+    assert url and url.endswith("_test"), "tests must never touch the main database"
     return create_engine(url)
 
 

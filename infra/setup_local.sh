@@ -3,6 +3,10 @@
 # facial recognition model files (YuNet + SFace).
 # Idempotent: running it twice does not break anything and never overwrites existing secrets.
 #
+# macOS (Homebrew) and Linux. On Linux the current user needs a PostgreSQL role with superuser rights first
+# (sudo -u postgres createuser -s "$USER"): enabling pgvector needs it once (manual de instalação).
+#   FOTOMAC_DB_NAME=fotomac_demo infra/setup_local.sh   # another database/role name on the same machine
+#
 # Production (CESMAC server) does NOT use this script: there the DBA/infra team provides
 # the database and the SeaweedFS endpoint, and only backend/.env changes.
 set -euo pipefail
@@ -10,7 +14,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$ROOT/backend/.env"
 S3_CONFIG="$ROOT/infra/seaweedfs/s3.json"
-PG_BIN="/opt/homebrew/opt/postgresql@17/bin"
+# The database name is also the name of its role; the test database is <name>_test. A second installation on the
+# same machine (a demonstration, a test from scratch) uses another name and never touches the first one.
+DB_NAME="${FOTOMAC_DB_NAME:-fotomac}"
+[[ "$DB_NAME" =~ ^[a-z][a-z0-9_]{2,40}$ ]] || { echo "FOTOMAC_DB_NAME inválido: use letras minúsculas, números e _"; exit 1; }
+# PostgreSQL 17: Homebrew (Apple silicon or Intel) or the Debian/Ubuntu package; PG_BIN overrides.
+for dir in "${PG_BIN:-}" /opt/homebrew/opt/postgresql@17/bin /usr/local/opt/postgresql@17/bin /usr/lib/postgresql/17/bin; do
+  if [[ -n "$dir" && -x "$dir/psql" ]]; then PG_BIN="$dir"; break; fi
+done
+[[ -x "${PG_BIN:-}/psql" ]] || { echo "PostgreSQL 17 não encontrado (defina PG_BIN com a pasta bin dele)."; exit 1; }
+# SHA-256: shasum on macOS, sha256sum on Linux.
+sha256() { if command -v shasum >/dev/null; then shasum -a 256 "$1"; else sha256sum "$1"; fi | cut -d' ' -f1; }
 
 rand() { openssl rand -base64 64 | tr -dc 'A-Za-z0-9' | cut -c1-"$1"; }
 
@@ -19,8 +33,8 @@ if [[ ! -f "$ENV_FILE" ]]; then
   DB_PASS="$(rand 32)"; S3_KEY="$(rand 20)"; S3_SECRET="$(rand 40)"
   cat >"$ENV_FILE" <<EOF
 # Local secrets — NEVER commit this file (it is in .gitignore).
-FOTOMAC_DATABASE_URL=postgresql+psycopg://fotomac:${DB_PASS}@127.0.0.1:5432/fotomac
-FOTOMAC_TEST_DATABASE_URL=postgresql+psycopg://fotomac:${DB_PASS}@127.0.0.1:5432/fotomac_test
+FOTOMAC_DATABASE_URL=postgresql+psycopg://${DB_NAME}:${DB_PASS}@127.0.0.1:5432/${DB_NAME}
+FOTOMAC_TEST_DATABASE_URL=postgresql+psycopg://${DB_NAME}:${DB_PASS}@127.0.0.1:5432/${DB_NAME}_test
 FOTOMAC_S3_ENDPOINT=http://127.0.0.1:8333
 FOTOMAC_S3_ACCESS_KEY=${S3_KEY}
 FOTOMAC_S3_SECRET_KEY=${S3_SECRET}
@@ -40,19 +54,20 @@ if ! grep -q '^FOTOMAC_IDENTITY_KEY=' "$ENV_FILE"; then
 fi
 # shellcheck disable=SC1090
 set -a; source "$ENV_FILE"; set +a
-DB_PASS="$(sed -E 's#.*://fotomac:([^@]+)@.*#\1#' <<<"$FOTOMAC_DATABASE_URL")"
+DB_PASS="$(sed -E 's#.*://[a-z0-9_]+:([^@]+)@.*#\1#' <<<"$FOTOMAC_DATABASE_URL")"
+DB_NAME="$(sed -E 's#.*/([a-z0-9_]+)$#\1#' <<<"$FOTOMAC_DATABASE_URL")"   # the .env decides, once it exists
 
 # 2. PostgreSQL: dedicated role (not superuser) owning its own databases.
 "$PG_BIN/psql" -d postgres -v ON_ERROR_STOP=1 -q <<SQL
 DO \$\$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'fotomac') THEN
-    CREATE ROLE fotomac LOGIN PASSWORD '${DB_PASS}' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_NAME}') THEN
+    CREATE ROLE ${DB_NAME} LOGIN PASSWORD '${DB_PASS}' NOSUPERUSER NOCREATEDB NOCREATEROLE;
   END IF;
 END \$\$;
 SQL
-for db in fotomac fotomac_test; do
+for db in "$DB_NAME" "${DB_NAME}_test"; do
   if ! "$PG_BIN/psql" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1; then
-    "$PG_BIN/createdb" -O fotomac "$db"
+    "$PG_BIN/createdb" -O "$DB_NAME" "$db"
   fi
   # pgvector needs a superuser to be enabled once; the app role then only uses it.
   "$PG_BIN/psql" -d "$db" -q -c "CREATE EXTENSION IF NOT EXISTS vector;"
@@ -61,7 +76,7 @@ for db in fotomac fotomac_test; do
   # pg_trgm: public search tolerant to simple spelling mistakes ("fecil" finds "FeCiAL").
   "$PG_BIN/psql" -d "$db" -q -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
 done
-echo "PostgreSQL: bancos fotomac e fotomac_test prontos (extensão vector ativa)."
+echo "PostgreSQL: bancos ${DB_NAME} e ${DB_NAME}_test prontos (extensões vector, unaccent e pg_trgm ativas)."
 
 # 3. SeaweedFS S3 identities. There is NO anonymous identity: unauthenticated requests are
 #    refused, so the photo bucket is private by default.
@@ -87,9 +102,9 @@ MODELS="$ROOT/backend/models"
 ZOO="https://github.com/opencv/opencv_zoo/raw/main/models"
 mkdir -p "$MODELS"
 while read -r file folder sum; do
-  if [[ ! -f "$MODELS/$file" ]] || [[ "$(shasum -a 256 "$MODELS/$file" | cut -d' ' -f1)" != "$sum" ]]; then
+  if [[ ! -f "$MODELS/$file" ]] || [[ "$(sha256 "$MODELS/$file")" != "$sum" ]]; then
     curl -fsSL -o "$MODELS/$file.part" "$ZOO/$folder/$file"
-    [[ "$(shasum -a 256 "$MODELS/$file.part" | cut -d' ' -f1)" == "$sum" ]] || { echo "Checksum diferente: $file"; rm -f "$MODELS/$file.part"; exit 1; }
+    [[ "$(sha256 "$MODELS/$file.part")" == "$sum" ]] || { echo "Checksum diferente: $file"; rm -f "$MODELS/$file.part"; exit 1; }
     mv "$MODELS/$file.part" "$MODELS/$file"
   fi
 done <<LIST
